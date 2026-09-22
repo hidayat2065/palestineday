@@ -61,6 +61,95 @@ pipeline {
             }
         }
 
+stage('Database Bootstrap') {
+    steps {
+        echo '=== DATABASE BOOTSTRAP ==='
+
+        sh '''
+            set -e
+            set +x
+
+            ENV_FILE="${APP_DIR}/.env"
+            SQL_FILE="${WORKSPACE}/database/staging/staging.sql"
+
+            if [ ! -f "$ENV_FILE" ]; then
+                echo "ERROR: .env tidak ditemukan"
+                exit 1
+            fi
+
+            if [ ! -f "$SQL_FILE" ]; then
+                echo "ERROR: staging.sql tidak ditemukan"
+                exit 1
+            fi
+
+            get_env() {
+                grep -E "^$1=" "$ENV_FILE" \
+                    | tail -1 \
+                    | cut -d= -f2- \
+                    | sed 's/^"//;s/"$//'
+            }
+
+            DB_HOST=$(get_env DB_HOST)
+            DB_PORT=$(get_env DB_PORT)
+            DB_NAME=$(get_env DB_DATABASE)
+            DB_USER=$(get_env DB_USERNAME)
+            DB_PASS=$(get_env DB_PASSWORD)
+
+            MYSQL_CNF=$(mktemp)
+            chmod 600 "$MYSQL_CNF"
+
+            trap 'rm -f "$MYSQL_CNF"' EXIT
+
+            cat > "$MYSQL_CNF" <<EOF
+[client]
+host=$DB_HOST
+port=$DB_PORT
+user=$DB_USER
+password=$DB_PASS
+database=$DB_NAME
+EOF
+
+            TABLE_COUNT=$(mysql \
+                --defaults-extra-file="$MYSQL_CNF" \
+                -Nse "
+                SELECT COUNT(*)
+                FROM information_schema.tables
+                WHERE table_schema='$DB_NAME'
+                AND table_name IN (
+                    'm_lokasi',
+                    'm_siswa_aktif',
+                    'm_nominal_donasi',
+                    't_donasi_palestineday'
+                );
+                "
+            )
+
+            echo "Detected application tables: $TABLE_COUNT / 4"
+
+            if [ "$TABLE_COUNT" -eq 0 ]; then
+                echo "Database kosong. Import staging schema..."
+
+                mysql \
+                    --defaults-extra-file="$MYSQL_CNF" \
+                    < "$SQL_FILE"
+
+                echo "Database bootstrap SUCCESS"
+
+            elif [ "$TABLE_COUNT" -eq 4 ]; then
+                echo "Database sudah tersedia. Bootstrap dilewati."
+
+            else
+                echo "ERROR: Database hanya memiliki $TABLE_COUNT dari 4 tabel."
+                echo "Tidak melakukan import otomatis untuk menghindari overwrite data."
+                exit 1
+            fi
+        '''
+    }
+}
+
+
+
+
         stage('Composer Install') {
             steps {
                 echo '=== COMPOSER INSTALL ==='
