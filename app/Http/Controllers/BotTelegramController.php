@@ -10,7 +10,7 @@ class BotTelegramController extends Controller
 {
     public function __construct()
     {
-        $response = Telegram::getMe();
+      //  $response = Telegram::getMe();
     }
 
     public function message() {
