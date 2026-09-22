@@ -1,6 +1,14 @@
 pipeline {
     agent any
 
+    parameters {
+        booleanParam(
+            name: 'RUN_DB_BOOTSTRAP_TEST',
+            defaultValue: false,
+            description: 'Test automatic bootstrap on palestineday_bootstrap_test'
+        )
+    }
+
     environment {
         APP_DIR = '/var/www/sekolah-staging2'
     }
@@ -10,12 +18,14 @@ pipeline {
         stage('Verify Source') {
             steps {
                 echo '=== VERIFY SOURCE ==='
+
                 sh '''
                     set -e
 
                     test -f composer.json
                     test -f artisan
                     test -d public
+                    test -f database/staging/staging.sql
 
                     echo "Laravel source OK"
                 '''
@@ -25,6 +35,7 @@ pipeline {
         stage('Verify Environment') {
             steps {
                 echo '=== VERIFY SERVER ==='
+
                 sh '''
                     set -e
 
@@ -61,94 +72,193 @@ pipeline {
             }
         }
 
-stage('Database Bootstrap') {
-    steps {
-        echo '=== DATABASE BOOTSTRAP ==='
+        stage('Database Bootstrap') {
+            steps {
+                echo '=== DATABASE BOOTSTRAP ==='
 
-        sh '''
-            set -e
-            set +x
+                sh '''
+                    set -e
+                    set +x
 
-            ENV_FILE="${APP_DIR}/.env"
-            SQL_FILE="${WORKSPACE}/database/staging/staging.sql"
+                    ENV_FILE="${APP_DIR}/.env"
+                    SQL_FILE="${WORKSPACE}/database/staging/staging.sql"
 
-            if [ ! -f "$ENV_FILE" ]; then
-                echo "ERROR: .env tidak ditemukan"
-                exit 1
-            fi
+                    get_env() {
+                        grep -E "^$1=" "$ENV_FILE" \
+                            | tail -1 \
+                            | cut -d= -f2- \
+                            | sed 's/^"//;s/"$//'
+                    }
 
-            if [ ! -f "$SQL_FILE" ]; then
-                echo "ERROR: staging.sql tidak ditemukan"
-                exit 1
-            fi
+                    DB_HOST=$(get_env DB_HOST)
+                    DB_PORT=$(get_env DB_PORT)
+                    DB_NAME=$(get_env DB_DATABASE)
+                    DB_USER=$(get_env DB_USERNAME)
+                    DB_PASS=$(get_env DB_PASSWORD)
 
-            get_env() {
-                grep -E "^$1=" "$ENV_FILE" \
-                    | tail -1 \
-                    | cut -d= -f2- \
-                    | sed 's/^"//;s/"$//'
-            }
+                    MYSQL_CNF=$(mktemp)
+                    chmod 600 "$MYSQL_CNF"
 
-            DB_HOST=$(get_env DB_HOST)
-            DB_PORT=$(get_env DB_PORT)
-            DB_NAME=$(get_env DB_DATABASE)
-            DB_USER=$(get_env DB_USERNAME)
-            DB_PASS=$(get_env DB_PASSWORD)
+                    trap 'rm -f "$MYSQL_CNF"' EXIT
 
-            MYSQL_CNF=$(mktemp)
-            chmod 600 "$MYSQL_CNF"
-
-            trap 'rm -f "$MYSQL_CNF"' EXIT
-
-            cat > "$MYSQL_CNF" <<EOF
+                    cat > "$MYSQL_CNF" <<EOF
 [client]
 host=$DB_HOST
 port=$DB_PORT
 user=$DB_USER
 password=$DB_PASS
-database=$DB_NAME
 EOF
 
-            TABLE_COUNT=$(mysql \
-                --defaults-extra-file="$MYSQL_CNF" \
-                -Nse "
-                SELECT COUNT(*)
-                FROM information_schema.tables
-                WHERE table_schema='$DB_NAME'
-                AND table_name IN (
-                    'm_lokasi',
-                    'm_siswa_aktif',
-                    'm_nominal_donasi',
-                    't_donasi_palestineday'
-                );
-                "
-            )
+                    TABLE_COUNT=$(mysql \
+                        --defaults-extra-file="$MYSQL_CNF" \
+                        -Nse "
+                        SELECT COUNT(*)
+                        FROM information_schema.tables
+                        WHERE table_schema='$DB_NAME'
+                        AND table_name IN (
+                            'm_lokasi',
+                            'm_siswa_aktif',
+                            'm_nominal_donasi',
+                            't_donasi_palestineday'
+                        );
+                        "
+                    )
 
-            echo "Detected application tables: $TABLE_COUNT / 4"
+                    echo "Detected application tables: $TABLE_COUNT / 4"
 
-            if [ "$TABLE_COUNT" -eq 0 ]; then
-                echo "Database kosong. Import staging schema..."
+                    if [ "$TABLE_COUNT" -eq 0 ]; then
 
-                mysql \
-                    --defaults-extra-file="$MYSQL_CNF" \
-                    < "$SQL_FILE"
+                        echo "Database kosong. Import staging.sql..."
 
-                echo "Database bootstrap SUCCESS"
+                        mysql \
+                            --defaults-extra-file="$MYSQL_CNF" \
+                            "$DB_NAME" \
+                            < "$SQL_FILE"
 
-            elif [ "$TABLE_COUNT" -eq 4 ]; then
-                echo "Database sudah tersedia. Bootstrap dilewati."
+                        echo "Database bootstrap SUCCESS"
 
-            else
-                echo "ERROR: Database hanya memiliki $TABLE_COUNT dari 4 tabel."
-                echo "Tidak melakukan import otomatis untuk menghindari overwrite data."
-                exit 1
-            fi
-        '''
-    }
-}
+                    elif [ "$TABLE_COUNT" -eq 4 ]; then
 
+                        echo "Database sudah tersedia. Bootstrap dilewati."
 
+                    else
 
+                        echo "ERROR: hanya ditemukan $TABLE_COUNT dari 4 tabel."
+                        exit 1
+
+                    fi
+                '''
+            }
+        }
+
+        stage('Database Bootstrap Test') {
+
+            when {
+                expression {
+                    return params.RUN_DB_BOOTSTRAP_TEST
+                }
+            }
+
+            steps {
+                echo '=== DATABASE BOOTSTRAP RECOVERY TEST ==='
+
+                sh '''
+                    set -e
+                    set +x
+
+                    TEST_DB="palestineday_bootstrap_test"
+                    ENV_FILE="${APP_DIR}/.env"
+                    SQL_FILE="${WORKSPACE}/database/staging/staging.sql"
+
+                    get_env() {
+                        grep -E "^$1=" "$ENV_FILE" \
+                            | tail -1 \
+                            | cut -d= -f2- \
+                            | sed 's/^"//;s/"$//'
+                    }
+
+                    DB_HOST=$(get_env DB_HOST)
+                    DB_PORT=$(get_env DB_PORT)
+                    DB_USER=$(get_env DB_USERNAME)
+                    DB_PASS=$(get_env DB_PASSWORD)
+
+                    MYSQL_CNF=$(mktemp)
+                    chmod 600 "$MYSQL_CNF"
+
+                    trap 'rm -f "$MYSQL_CNF"' EXIT
+
+                    cat > "$MYSQL_CNF" <<EOF
+[client]
+host=$DB_HOST
+port=$DB_PORT
+user=$DB_USER
+password=$DB_PASS
+EOF
+
+                    TABLE_COUNT=$(mysql \
+                        --defaults-extra-file="$MYSQL_CNF" \
+                        -Nse "
+                        SELECT COUNT(*)
+                        FROM information_schema.tables
+                        WHERE table_schema='$TEST_DB'
+                        AND table_name IN (
+                            'm_lokasi',
+                            'm_siswa_aktif',
+                            'm_nominal_donasi',
+                            't_donasi_palestineday'
+                        );
+                        "
+                    )
+
+                    echo "Before bootstrap: $TABLE_COUNT / 4 tables"
+
+                    if [ "$TABLE_COUNT" -eq 0 ]; then
+
+                        echo "Empty test database detected."
+                        echo "Importing staging.sql..."
+
+                        mysql \
+                            --defaults-extra-file="$MYSQL_CNF" \
+                            "$TEST_DB" \
+                            < "$SQL_FILE"
+
+                    elif [ "$TABLE_COUNT" -eq 4 ]; then
+
+                        echo "Test database already bootstrapped."
+
+                    else
+
+                        echo "ERROR: Test DB has partial schema: $TABLE_COUNT / 4"
+                        exit 1
+
+                    fi
+
+                    VERIFY_COUNT=$(mysql \
+                        --defaults-extra-file="$MYSQL_CNF" \
+                        -Nse "
+                        SELECT COUNT(*)
+                        FROM information_schema.tables
+                        WHERE table_schema='$TEST_DB'
+                        AND table_name IN (
+                            'm_lokasi',
+                            'm_siswa_aktif',
+                            'm_nominal_donasi',
+                            't_donasi_palestineday'
+                        );
+                        "
+                    )
+
+                    echo "After bootstrap: $VERIFY_COUNT / 4 tables"
+
+                    if [ "$VERIFY_COUNT" -ne 4 ]; then
+                        echo "DATABASE RECOVERY TEST FAILED"
+                        exit 1
+                    fi
+
+                    echo "DATABASE RECOVERY TEST SUCCESS"
+                '''
+            }
+        }
 
         stage('Composer Install') {
             steps {
@@ -200,7 +310,9 @@ EOF
 
                     echo "HTTP Status: ${HTTP_CODE}"
 
-                    if [ "${HTTP_CODE}" -lt 200 ] || [ "${HTTP_CODE}" -ge 400 ]; then
+                    if [ "${HTTP_CODE}" -lt 200 ] || \
+                       [ "${HTTP_CODE}" -ge 400 ]; then
+
                         echo "Health check FAILED"
                         exit 1
                     fi
@@ -212,6 +324,7 @@ EOF
     }
 
     post {
+
         success {
             echo '✅ Palestine Day staging2 deployment SUCCESS'
         }
